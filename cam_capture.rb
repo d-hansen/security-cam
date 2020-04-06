@@ -38,7 +38,7 @@ CAM_cmp_defs = {
     'rmse' => {
           avg_size: 600,        ## Number of samples to average RMSE for baseline
           avg_cap: 0.025,       ## Cap rmse avg at 2.5%
-          threshold_pct: 0.12,  ## 12% change over average RMSE baseline triggers frame save
+          threshold_pct: 0.15,  ## 12% change over average RMSE baseline triggers frame save
       },
   }
 CAM_cmp_ctrl = CAM_cmp_defs[CAM_cmp_metric]
@@ -158,31 +158,6 @@ def decoder_ctl(mode)
   mode
 end
 
-def get_cam_video_info
-  vid_info = { pid: nil, date: nil, mode: nil }
-  if File::exist?(@vid_pid_file)
-    info = File::readlines(@vid_pid_file)
-    unless info.empty?
-      vid_info = {
-          pid: info[0].to_i
-          date: Date::parse(info[1]).to_time
-          mode: info[2].to_sym
-        }
-    end
-  end
-  vid_info
-end
-
-def launch_cam_video(mode, info)
-  begin
-    if Process.kill(0, other_pid)
-      ## There's still another PID running, GTFO
-      warn "Process #{other_pid} found!"
-    end
-  rescue Errno::ESRCH
-  end
-end
-
 trap('SIGHUP') { reopen_log }
 trap('SIGQUIT') { @quit = true }
 trap('SIGINT') { @quit = true }
@@ -229,9 +204,6 @@ begin
     Process.daemon
     File::write(@pid_file, "#{Process.pid}\n")
   end
-
-  @vid_pid_file = PID_file + "-#{@webcam}.pid"
-  vid_info = get_cam_video_info
 
   ## This causes unnecessarily heavy rewrite of the same block on the flash
   #@logout.sync = true
@@ -283,20 +255,14 @@ begin
       sleep(wait_secs) if wait_secs > 0.0
       cur_time = Time.now
 
-      ## Check if it's time to spawn the video compilation
-      if vid_info[:mode].eql?(:nighttime) && cur_time.hour > 8
-        vid_mode = launch_cam_video(:daytime)
-      elsif vid_mode.eql?(:daytime) && cur_time.hour > 20
-      end
-
       @http = Net::HTTP.start(@snapshot_uri.hostname, @snapshot_uri.port) if @http.nil?
 
       ## Check if we need to turn on/off IR
       webcam_decoder_ctl_params = nil
-      if (cur_time > sunrise) && (cur_time < sunset) && (webcam_ir_mode != :off)
-        webcam_ir_mode = decoder_ctl(:off)
-      elsif (webcam_ir_mode != :on)
-        webcam_ir_mode = decoder_ctl(:on)
+      if (cur_time > sunrise) && (cur_time < sunset)
+        webcam_ir_mode = decoder_ctl(:off) unless webcam_ir_mode.eql?(:off)
+      else
+        webcam_ir_mode = decoder_ctl(:on) unless webcam_ir_mode.eql?(:on)
       end
       next if webcam_ir_mode.nil?
 

@@ -6,12 +6,12 @@ require 'date'
 
 PID_video_file = '/var/run/cam_video'.freeze
 CAM_root = '/data/security-cam'.freeze
-CAM_log_file = '/data/cam_video.log'.freeze
+LOG_vid_file = '/data/cam_video.log'.freeze
 
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze unless defined?(LOG_TIME_fmt)
 
-@logout = $stdout if defined?(@login).nil? || @logout.nil?
-@logerr = $stderr if defined?(@login).nil? || @logerr.nil?
+@logout = $stdout if defined?(@logout).nil? || @logout.nil?
+@logerr = $stderr if defined?(@logerr).nil? || @logerr.nil?
 @logout.sync = true
 @logerr.sync = true
 
@@ -84,7 +84,7 @@ begin
         error "Invalid date format #{arg.inspect}"
       end
     when /\A-log\z/i
-      @logout = @logerr = File::open(LOG_file, 'a')
+      @logout = @logerr = File::open(LOG_vid_file, 'a')
     else
       error "Only one webcam can be monitored per invocation!" unless @webcam.nil?
       @webcam = arg
@@ -155,7 +155,7 @@ begin
   ## Remove the individual images
   img_files.each { |img| File::delete(img) }
 
-  notice "Done!"
+  notice "Done processing #{img_files.size} images into #{@mode.to_s} video!"
 
 rescue => ex
   error("#{ex.inspect}\n\t#{ex.backtrace.join("\n\t")}", action: :continue)
