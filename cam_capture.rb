@@ -4,7 +4,7 @@ require 'net/http'
 require 'fileutils'
 require 'open3'
 require 'sun'
-require 'byebug'
+##require 'byebug'
 
 ## Security camera credentials are kept in the following un-committed location
 ## following this format:
@@ -55,9 +55,9 @@ CAM_IR_MODE = {
   }
 
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze
-LOG_file = File::join(CAM_root, 'cam_capture.log').freeze
-PID_file = '/var/run/cam_capture'.freeze
-PID_video_file = '/var/run/cam_video'.freeze
+
+LOG_file_path = File::join(CAM_root, 'logs').freeze
+PID_file_prefix = '/var/run/cam_capture'.freeze
 
 
 $stdout.sync = true
@@ -67,7 +67,7 @@ $stderr.sync = true
 @logerr = $stderr
 
 def log_prefix
-  "#{Time.now.strftime(LOG_TIME_fmt)}IC(#{@webcam})"
+  "#{Time.now.strftime(LOG_TIME_fmt)}CC(#{@webcam})"
 end
 
 def error(msg, opts = {action: :exit})
@@ -96,21 +96,32 @@ end
 def reopen_log
   notice "SIGHUP received"
   return if @logout.eql?($stdout)
-  notice "(re)opening log file"
+  notice "closing and (re)opening log file" ## This ends up in the old log file
   @logerr.close unless @logerr.eql?(@logout)
   @logout.close
-  @logout = @logerr = File::open(LOG_file, 'a')
-  notice "log file reopened"
+  @logout = @logerr = File::open(@log_fn, 'a')
+  notice "log file reopened"  ## This should end up in the new log file
 end
 
-def gm_timestamp(file, time)
+def make_path(path)
+  unless Dir::exist?(path)
+    FileUtils::mkdir_p(path) 
+    notice "Created directory #{path}"
+  end
+  path
+end
+
+def gm_timestamp(img_file, time, new_path)
   ret = nil
-  gm_cmd = "gm convert -font #{CAM_font} -pointsize 16 -fill white -draw \"text 10,10 '#{time.strftime('%Y/%m/%d %H:%M:%S.%3N')}'\" #{file} #{file}"
+  new_img_file = File::join(new_path, File::basename(img_file))
+  gm_cmd = "gm convert -font #{CAM_font} -pointsize 16 -fill white -draw \"text 10,10 '#{time.strftime('%Y/%m/%d %H:%M:%S.%3N')}'\" #{img_file} #{new_img_file}"
   stdout, stderr, status = Open3.capture3(gm_cmd)
   err = stderr.strip
   if err.size > 0 || status != 0
     error("failed #{status}: #{err}", action: :continue)
+    File::rename(img_file, new_img_file) unless File::size?(new_img_file)
   end
+  File::delete(img_file) if File::exist?(img_file)
   ret
 rescue Errno::ENOENT => e
   error("#{gm_cmd}\n\t#{e.message}", action: :continue)
@@ -165,7 +176,8 @@ trap('SIGINT') { @quit = true }
 begin
   @webcam = nil
   @daemon = false
-  @pid_file = nil
+  @pid_fn = nil
+  @log_fn = nil
   @quit = false
 
   while ARGV.size > 0
@@ -185,24 +197,38 @@ begin
 
   if @daemon
     ## If another is running, kill it first
-    @pid_file = PID_file + "-#{@webcam}.pid"
-    if File::exist?(@pid_file)
-      other_pid = File::read(@pid_file).to_i
-      notice "Killing #{other_pid}"
+    @pid_fn = PID_file_prefix + "-#{@webcam}.pid"
+    if File::exist?(@pid_fn)
+      other_pid = File::read(@pid_fn).to_i
       begin
         ## make sure other PID is gone before continuing
-        Process.kill('SIGINT', other_pid)
-        while Process.kill(0, other_pid)
-          notice "Waiting on #{other_pid}"
-          sleep 1 
+        wait_cnt = 0
+        sts = Process.kill('SIGINT', other_pid)
+        while sts > 0
+          notice "Waiting for #{other_pid} to exit" if (wait_cnt % 10) == 0
+          sleep 1
+          wait_cnt += 1
+          if (wait_cnt >= 150)        ## After 150 seconds -> give up
+            error "Failed to stop #{other_pid}!!!"
+          elsif (wait_cnt >= 120)     ## After 120 seconds -> time to HARD KILL
+            warn "Killing #{other_pid} with SIGKILL!!!"
+            sig = 'SIGKILL'
+          elsif (wait_cnt % 30) == 0  ## After each 30 seconds, re-send SIGINT
+            warn "Killing #{other_pid} with SIGINT again!"
+            sig = 'SIGINT'
+          else
+            sig = 0
+          end
+          sts = Process.kill(sig, other_pid)
         end
       rescue Errno::ESRCH
-        notice "Process #{other_pid} not found - continuing to daemonize"
+        notice "Process #{other_pid} not found -> continuing to daemonize"
       end
     end
-    @logout = @logerr = File::open(LOG_file, 'a')
+    @log_fn = File::join(LOG_file_path, "cam_capture-#{@webcam}.log")
+    @logout = @logerr = File::open(@log_fn, 'a')
     Process.daemon
-    File::write(@pid_file, "#{Process.pid}\n")
+    File::write(@pid_fn, "#{Process.pid}\n")
   end
 
   ## This causes unnecessarily heavy rewrite of the same block on the flash
@@ -234,12 +260,9 @@ begin
   prev_img_time = nil
   err_count = 0
   webcam_ir_mode = nil
-  cur_dir = File::join(CAM_root, @webcam, 'current')
-  unless Dir::exist?(cur_dir)
-    FileUtils::mkdir_p(cur_dir) 
-    notice "Created directory #{cur_dir}"
-  end
-  pfx_sz = File::join(cur_dir, "#{@webcam}-YYYYmmdd-HH").size
+  save_dir = make_path(File::join(CAM_root, 'images', @webcam))
+  temp_dir = make_path(File::join('', 'tmp', 'security-cam', 'images', @webcam))
+  pfx_sz = File::join(temp_dir, "#{@webcam}-YYYYmmdd-HH").size
   until @quit do
     cur_day = cur_time.day
 
@@ -278,7 +301,7 @@ begin
         next
       elsif resp.is_a?(Net::HTTPSuccess)
         err_count = 0
-        img_path = File::join(cur_dir, "#{@webcam}-#{cur_time.strftime('%Y%m%d-%H%M%S_%3N')}.jpg")
+        img_path = File::join(temp_dir, "#{@webcam}-#{cur_time.strftime('%Y%m%d-%H%M%S_%3N')}.jpg")
         File::write(img_path, resp.body)
 
         ## Determine if this is a different enough image to keep
@@ -311,7 +334,7 @@ begin
           end
           case action
           when :SAVED, :SYNC
-            gm_timestamp(prev_img_path, prev_img_time)
+            gm_timestamp(prev_img_path, prev_img_time, save_dir)
             prev_img_path = img_path
             prev_img_time = cur_time
           when :drop, :ERROR
@@ -339,6 +362,6 @@ ensure
   notice "Exiting"
   if @daemon
     @logout.close
-    File::delete(@pid_file) if @pid_file && File::exist?(@pid_file)
+    File::delete(@pid_fn) if @pid_fn && File::exist?(@pid_fn)
   end
 end
