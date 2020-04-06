@@ -6,6 +6,7 @@ require 'date'
 
 PID_video_file = '/var/run/cam_video'.freeze
 CAM_root = '/data/security-cam'.freeze
+CAM_log_file = '/data/cam_video.log'.freeze
 
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze unless defined?(LOG_TIME_fmt)
 
@@ -82,6 +83,8 @@ begin
       rescue => ex
         error "Invalid date format #{arg.inspect}"
       end
+    when /\A-log\z/i
+      @logout = @logerr = File::open(LOG_file, 'a')
     else
       error "Only one webcam can be monitored per invocation!" unless @webcam.nil?
       @webcam = arg
