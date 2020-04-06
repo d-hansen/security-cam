@@ -28,8 +28,20 @@ require_relative File::expand_path('~/.cam_creds.rb')
 CAM_period = 0.5              ## How often to capture frames for analysis
 CAM_max_delta = 120.0         ## Max seconds of no change before capturing frame anyway
 
-CAM_MAE_avg_size = 600        ## Number of samples to average MAE for comparison
-CAM_MAE_threshold_pct = 0.08  ## 8% change compared to MAE average triggers frame save
+CAM_cmp_metric = 'rmse'
+CAM_cmp_defs = {
+    'mae' =>  {
+          avg_size: 600,        ## Number of samples to average MAE for baseline
+          avg_cap: 0.017,       ## Cap mae avg at 1.7%
+          threshold_pct: 0.08,  ## 8% change over average MAE baseline triggers frame save
+      },
+    'rmse' => {
+          avg_size: 600,        ## Number of samples to average RMSE for baseline
+          avg_cap: 0.025,       ## Cap rmse avg at 2.5%
+          threshold_pct: 0.12,  ## 12% change over average RMSE baseline triggers frame save
+      },
+  }
+CAM_cmp_ctrl = CAM_cmp_defs[CAM_cmp_metric]
 
 SNAPSHOT_url = '/snapshot.cgi'.freeze
 STREAM_url = '/videostream.cgi'.freeze
@@ -43,8 +55,9 @@ CAM_IR_MODE = {
   }
 
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze
-LOG_File = File::join(CAM_root, 'cam_capture.log').freeze
-PID_File = '/var/run/cam_capture'.freeze
+LOG_file = File::join(CAM_root, 'cam_capture.log').freeze
+PID_file = '/var/run/cam_capture'.freeze
+PID_video_file = '/var/run/cam_video'.freeze
 
 
 $stdout.sync = true
@@ -54,7 +67,7 @@ $stderr.sync = true
 @logerr = $stderr
 
 def log_prefix
-  "#{Time.now.strftime(LOG_TIME_fmt)}(#{@webcam})"
+  "#{Time.now.strftime(LOG_TIME_fmt)}IC(#{@webcam})"
 end
 
 def error(msg, opts = {action: :exit})
@@ -65,7 +78,6 @@ def error(msg, opts = {action: :exit})
   else raise "Invalid error action: #{opts[:action].inspect}, must be :exit or :continue"
   end
 end
-
 def warn(msg)
   @logerr.puts("#{log_prefix} \e[1;33;43mWARNING:\e[0m #{msg}")
 end
@@ -87,7 +99,7 @@ def reopen_log
   notice "(re)opening log file"
   @logerr.close unless @logerr.eql?(@logout)
   @logout.close
-  @logout = @logerr = File::open(LOG_File, 'a')
+  @logout = @logerr = File::open(LOG_file, 'a')
   notice "log file reopened"
 end
 
@@ -107,7 +119,7 @@ end
 
 def gm_compare(file1, file2)
   ret = nil
-  gm_cmd = "gm compare -metric MAE #{file1} #{file2}"
+  gm_cmd = "gm compare -metric #{CAM_cmp_metric} #{file1} #{file2}"
   stdout, stderr, status = Open3.capture3(gm_cmd)
   err = stderr.strip
   if err.size > 0 || status != 0
@@ -146,6 +158,31 @@ def decoder_ctl(mode)
   mode
 end
 
+def get_cam_video_info
+  vid_info = { pid: nil, date: nil, mode: nil }
+  if File::exist?(@vid_pid_file)
+    info = File::readlines(@vid_pid_file)
+    unless info.empty?
+      vid_info = {
+          pid: info[0].to_i
+          date: Date::parse(info[1]).to_time
+          mode: info[2].to_sym
+        }
+    end
+  end
+  vid_info
+end
+
+def launch_cam_video(mode, info)
+  begin
+    if Process.kill(0, other_pid)
+      ## There's still another PID running, GTFO
+      warn "Process #{other_pid} found!"
+    end
+  rescue Errno::ESRCH
+  end
+end
+
 trap('SIGHUP') { reopen_log }
 trap('SIGQUIT') { @quit = true }
 trap('SIGINT') { @quit = true }
@@ -173,7 +210,7 @@ begin
 
   if @daemon
     ## If another is running, kill it first
-    @pid_file = PID_File + "-#{@webcam}.pid"
+    @pid_file = PID_file + "-#{@webcam}.pid"
     if File::exist?(@pid_file)
       other_pid = File::read(@pid_file).to_i
       notice "Killing #{other_pid}"
@@ -188,11 +225,13 @@ begin
         notice "Process #{other_pid} not found - continuing to daemonize"
       end
     end
-    @logout = @logerr = File::open(LOG_File, 'a')
+    @logout = @logerr = File::open(LOG_file, 'a')
     Process.daemon
     File::write(@pid_file, "#{Process.pid}\n")
   end
 
+  @vid_pid_file = PID_file + "-#{@webcam}.pid"
+  vid_info = get_cam_video_info
 
   ## This causes unnecessarily heavy rewrite of the same block on the flash
   #@logout.sync = true
@@ -216,7 +255,7 @@ begin
     @decoder_ctl_req[mode]['Connection'] = 'keep-alive'
   end
 
-  mae_avg = nil
+  metric_avg = nil
   cur_time = Time.now
   last_time = cur_time - CAM_period - 0.1
   prev_img_path = img_path = nil
@@ -244,13 +283,19 @@ begin
       sleep(wait_secs) if wait_secs > 0.0
       cur_time = Time.now
 
+      ## Check if it's time to spawn the video compilation
+      if vid_info[:mode].eql?(:nighttime) && cur_time.hour > 8
+        vid_mode = launch_cam_video(:daytime)
+      elsif vid_mode.eql?(:daytime) && cur_time.hour > 20
+      end
+
       @http = Net::HTTP.start(@snapshot_uri.hostname, @snapshot_uri.port) if @http.nil?
 
       ## Check if we need to turn on/off IR
       webcam_decoder_ctl_params = nil
       if (cur_time > sunrise) && (cur_time < sunset) && (webcam_ir_mode != :off)
         webcam_ir_mode = decoder_ctl(:off)
-      elsif (webcam_ir_mode != :off)
+      elsif (webcam_ir_mode != :on)
         webcam_ir_mode = decoder_ctl(:on)
       end
       next if webcam_ir_mode.nil?
@@ -275,34 +320,35 @@ begin
           prev_img_path = img_path
           prev_img_time = cur_time
         else
-          mae = gm_compare(prev_img_path, img_path)
-          if mae.nil?
-            action = 'ERROR'
+          metric_val = gm_compare(prev_img_path, img_path)
+          if metric_val.nil?
+            action = :ERROR
           else
-            if mae_avg.nil?
-              mae_ary = [mae] * CAM_MAE_avg_size
-              mae_avg = mae
+            metric_capped = (metric_val < CAM_cmp_ctrl[:avg_cap]) ? metric_val : CAM_cmp_ctrl[:avg_cap]
+            if metric_avg.nil?
+              metric_ary = [metric_capped] * CAM_cmp_ctrl[:avg_size]
+              metric_avg = metric_capped
             else
-              mae_avg += (mae - mae_ary.shift)/mae_ary.size
-              mae_ary.push(mae)
+              metric_avg += (metric_capped - metric_ary.shift)/metric_ary.size
+              metric_ary.push(metric_capped)
             end
-            diff = mae - mae_avg
+            diff = metric_val - metric_avg
             action = 
-              if (diff > (mae_avg * CAM_MAE_threshold_pct))
-                'SAVED'
+              if (diff > (metric_avg * CAM_cmp_ctrl[:threshold_pct]))
+                :SAVED
               elsif ((cur_time - prev_img_time) > CAM_max_delta)
-                'SYNC'
+                :SYNC
               else
-                'drop'
+                :drop
               end
-            info "compare [#{prev_img_path[pfx_sz..-5]} ≏ #{img_path[pfx_sz..-5]}] #{sprintf('mae:%.4f, ⌀:%.4f, Δ:%.4f', mae, mae_avg, diff)} -> #{action}"
+            info "#{webcam_ir_mode.eql?(:on) ? 'IR ' : ''}compare [#{prev_img_path[pfx_sz..-5]} ≟ #{img_path[pfx_sz..-5]}] #{sprintf('≏:%.4f, ⌀:%.4f, Δ:%.4f', metric_val, metric_avg, diff)} -> #{action.to_s}"
           end
           case action
-          when 'SAVED', 'SYNC'
+          when :SAVED, :SYNC
             gm_timestamp(prev_img_path, prev_img_time)
             prev_img_path = img_path
             prev_img_time = cur_time
-          when 'drop', 'ERROR'
+          when :drop, :ERROR
             File::delete(img_path)
           end
         end

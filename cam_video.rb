@@ -4,15 +4,18 @@ require 'open3'
 require 'byebug'
 require 'date'
 
+PID_video_file = '/var/run/cam_video'.freeze
 CAM_root = '/data/security-cam'.freeze
 
-@logout = $stdout
-@logerr = $stderr
+LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze unless defined?(LOG_TIME_fmt)
 
-LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze
+@logout = $stdout if defined?(@login).nil? || @logout.nil?
+@logerr = $stderr if defined?(@login).nil? || @logerr.nil?
+@logout.sync = true
+@logerr.sync = true
 
 def log_prefix
-  "#{Time.now.strftime(LOG_TIME_fmt)}(#{@webcam})"
+  "#{Time.now.strftime(LOG_TIME_fmt)}VP(#{@webcam})"
 end
 
 def error(msg, opts = {action: :exit})
@@ -23,31 +26,41 @@ def error(msg, opts = {action: :exit})
   else raise "Invalid error action: #{opts[:action].inspect}, must be :exit or :continue"
   end
 end
+def warn(msg)
+  @logerr.puts("#{log_prefix} \e[1;33;43mWARNING:\e[0m #{msg}")
+end
+
+def status(msg = '', opts = {})
+  @logerr.puts("#{log_prefix} #{opts[:tag] ? "\e[30;47m#{opts[:tag]}\e[0m " : ''}#{msg}")
+end
+
+def info(msg)
+  status(msg, tag: 'INFO:')
+end
+def notice(msg)
+  status(msg, tag: 'NOTICE:')
+end
 
 
+## The following filter_complex could be used instead of "unsafe=1"
+##cmd << "-filter_complex '[0:0]scale=w=640:h=480[i1];[1:0]scale=w=640:h=480[i2];[i1][i2]concat[v]' -map '[v]' #{mp4_path}"
+#
 def create_mp4(mp4_path, img_glob1, img_glob2 = nil)
   return if img_glob1.nil? && img_glob2.nil?
   cmd = "ffmpeg -y "
   cmd << "-f image2 -framerate 5 -pattern_type glob -i '#{img_glob1}' " unless img_glob1.nil?
   cmd << "-f image2 -framerate 5 -pattern_type glob -i '#{img_glob2}' " unless img_glob2.nil?
-  ##cmd << "-filter_complex '[0:0]scale=w=640:h=480[i1];[1:0]scale=w=640:h=480[i2];[i1][i2]concat[v]' -map '[v]' #{mp4_path}"
   cmd << "-filter_complex '[0:0][1:0]concat=unsafe=1[v]' -map '[v]' #{mp4_path}"
   stdout, stderr, status = Open3.capture3(cmd)
-  err = stderr.strip
-  if err.size > 0 || status != 0
-    error("command failed (#{status}) #{err}\n\t#{cmd}")
+  if status != 0
+    error("command failed (#{status})\nCMD:\t#{cmd}\nSTDERR:\t#{stderr.strip}\n")
   end
-  stdout.strip
-  
 rescue Errno => ex
-  error("#{ex.inspect}\n\t#{cmd}")
+  error("#{ex.inspect}\n\nCMD:\t#{cmd}")
 end
 
 @webcam = nil
 @webcam_dir = nil
-
-@logout.sync = true
-@logerr.sync = true
 
 @mode = nil
 
@@ -65,7 +78,7 @@ begin
     when /\A-date\z/i
       begin
         error "Missing <date> for -date!" unless ARGV.size > 0
-        cur_date = Date.parse(ARGV.shift).to_time
+        cur_date = Date::parse(ARGV.shift).to_time
       rescue => ex
         error "Invalid date format #{arg.inspect}"
       end
@@ -81,20 +94,43 @@ begin
   error "Please specify mode (-daytime or -nighttime)!" if @mode.nil?
   error "Please specify webcam!" if @webcam.nil?
 
-  img_dir = File::join(@webcam_dir, 'current.test')
+  img_dir = File::join(@webcam_dir, 'current')
 
   case @mode
   when :daytime
     img_glob0 = File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[89]*.jpg")
     img_glob1 = File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1*.jpg")
     mp4_date = cur_date
-    mp4_time = '08:00_19:59'
+    mp4_time = '0800_1959'
   when :nighttime
     prev_date = cur_date - 86400
     img_glob0 = File::join(img_dir, "#{@webcam}-#{prev_date.strftime('%Y%m%d')}-2*.jpg")
     img_glob1 = File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[01234567]*.jpg")
     mp4_date = prev_date
-    mp4_time = '20:00_07:59'
+    mp4_time = '2000_0759'
+  end
+
+  @pid_file = PID_video_file + "-#{@webcam}.pid"
+
+  ## Make sure we aren't or have already processed this request
+  if File::exist?(@pid_file)
+    info = File::readlines(@pid_file)
+    other_pid = info[0].to_i
+    notice "Checking #{other_pid}"
+    begin
+      if Process.kill(0, other_pid)
+        ## There's still another PID running, GTFO
+        error "Other Process #{other_pid} found - exiting!"
+      end
+    rescue Errno::ESRCH
+    end
+    ## Determine if it's even time to run again
+    last_date = Date::parse(info[1]).to_time
+    last_mode = info[2].to_sym
+    if last_date.eql?(mp4_date) && last_mode.eql?(@mode)
+      error "Already packaged video for #{mp4_date} #{@mode}"
+    end
+    File::write(@pid_file, "#{Process.pid}\n#{mp4_date}\n#{@mode.to_s}\n")
   end
 
   img_files = Dir::glob(img_glob0)
@@ -114,9 +150,9 @@ begin
   create_mp4(mp4_path, img_glob0, img_glob1)
 
   ## Remove the individual images
-  ##img_files.each { |img| File::delete(img) }
+  img_files.each { |img| File::delete(img) }
 
-  puts "Done!"
+  notice "Done!"
 
 rescue => ex
   error("#{ex.inspect}\n\t#{ex.backtrace.join("\n\t")}", action: :continue)
