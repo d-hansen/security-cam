@@ -67,9 +67,9 @@ begin
     arg = ARGV.shift
     case arg
     when /\A-night(?:time)?\z/i
-      set_compilation(:nighttime)
+      set_compilation(:night)
     when /\A-day(?:time)?\z/i
-      set_compilation(:daytime)
+      set_compilation(:day)
     when /\A-morning\z/i
       set_compilation(:morning)
     when /\A-afternoon\z/i
@@ -99,7 +99,7 @@ begin
       end
     end
   end
-  error "Please specify mode (-daytime or -nighttime)!" if @mode.nil?
+  error "Please specify mode (-day or -night)!" if @mode.nil?
   error "Please specify webcam!" if @webcam.nil?
 
   @logout = @logerr = File::open(LOG_fn, 'a') if open_log_file
@@ -110,20 +110,20 @@ begin
   when :current
     img_globs.push(File::join(img_dir, "*.jpg"))
   when :morning
-    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[89]*.jpg"))
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[789]*.jpg"))
     img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[01]*.jpg"))
   when :afternoon
-    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[234567]*.jpg"))
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[23456]*.jpg"))
   when :evening
-    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[89]*.jpg"))
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[789]*.jpg"))
     img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-2[01]*.jpg"))
-  when :daytime
-    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[89]*.jpg"))
+  when :day
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[789]*.jpg"))
     img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1*.jpg"))
-  when :nighttime
+  when :night
     prev_date = cur_date - 86400
     img_globs.push(File::join(img_dir, "#{@webcam}-#{prev_date.strftime('%Y%m%d')}-2*.jpg"))
-    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[01234567]*.jpg"))
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[0123456]*.jpg"))
     mp4_date = prev_date
   end
 
@@ -198,7 +198,7 @@ begin
   mp4_img_paths.each { |img_path| File::delete(img_path) }
   Dir::delete(mp4_img_dir)
 
-  notice "Done processing #{img_files.size} images into #{@mode.to_s} video!"
+  notice "Done processing #{mp4_img_paths.size} images into #{@mode.to_s} video!"
 
 rescue => ex
   error("#{ex.inspect}\n\t#{ex.backtrace.join("\n\t")}", action: :continue)
