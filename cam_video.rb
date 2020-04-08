@@ -20,41 +20,42 @@ VALID_MODES = {
     morning:    /\A-morning\z/i,
     afternoon:  /\A-afternoon\z/i,
     evening:    /\A-evening\z/i,
-    current:    /\A-current\z/i,
+    all:        /\A-(?:all)|(?:current)\z/i,
     continue:   /\A-(?:continue)|(?:resume)\z/i,
+    custom:     nil,    ## used if -time was given
+    date:       nil,    ## maybe used if -date was given without mode
   }
 
-@logout = $stdout if defined?(@logout).nil? || @logout.nil?
-@logerr = $stderr if defined?(@logerr).nil? || @logerr.nil?
-@logout.sync = true
-@logerr.sync = true
+$stdout.sync = true
 
-def log_prefix
-  "#{Time.now.strftime(LOG_TIME_fmt)}CV(#{@webcam})"
+def log_message(msg, opts = {})
+  msg = "#{Time.now.strftime(LOG_TIME_fmt)}CV(#{@webcam}) #{msg}"
+  @logout.puts(msg) unless opts.key?(:logout) && opts[:logout].eql?(false)
+  $stdout.puts(msg) unless opts.key?(:stdout) && opts[:stdout].eql?(false)
 end
 
 def error(msg, opts = {action: :exit})
-  @logerr.puts("#{log_prefix} \e[1;33;41mERROR:\e[0m #{msg}")
+  log_message("\e[1;33;41mERROR:\e[0m #{msg}", opts)
   case opts[:action]
   when :exit, nil then exit 255
   when :continue then return;
   else raise "Invalid error action: #{opts[:action].inspect}, must be :exit or :continue"
   end
 end
-def warn(msg)
-  @logerr.puts("#{log_prefix} \e[1;33;43mWARNING:\e[0m #{msg}")
+def warn(msg, opts = {})
+  log_message("\e[1;33;43mWARNING:\e[0m #{msg}", opts)
 end
 
 def status(msg = '', opts = {})
-  @logerr.puts("#{log_prefix} #{opts[:tag] ? "\e[30;47m#{opts[:tag]}\e[0m " : ''}#{msg}")
+  log_message(opts[:tag] ? "\e[30;47m#{opts[:tag]}\e[0m #{msg}" : msg, opts)
+end
+def info(msg, opts = {})
+  status(msg, opts.merge(tag: 'INFO:'))
+end
+def notice(msg, opts = {})
+  status(msg, opts.merge(tag: 'NOTICE:'))
 end
 
-def info(msg)
-  status(msg, tag: 'INFO:')
-end
-def notice(msg)
-  status(msg, tag: 'NOTICE:')
-end
 
 def make_path(path)
   unless Dir::exist?(path)
@@ -65,7 +66,7 @@ def make_path(path)
 end
 
 def set_compilation(mode)
-  error "Only one compilation mode can be specified!" unless @mode.nil?
+  error "Only one compilation mode can be specified!" unless @mode.nil? || @mode.eql?(:date)
   @mode = mode
 end
 
@@ -93,7 +94,8 @@ end
 @mode = nil
 
 begin
-  open_log_file = false
+  log_file_only = false
+  custom_start = custom_stop = nil
   cur_date = Time.now
   while ARGV.size > 0
     arg = ARGV.shift
@@ -106,13 +108,25 @@ begin
         begin
           error "Missing <date> for -date!" unless ARGV.size > 0
           cur_date = Time::parse(ARGV.shift)
+          @mode = :date
         rescue => ex
           error "Invalid date format #{arg.inspect}"
         end
-      when /\A-log\z/i
-        open_log_file = true
+      when /\A-custom\z/i
+        error "Must specify time range with -time" unless ARGV.size > 0
+        time_str = ARGV.shift
+        if time_str =~ /\A(\d{2}:\d{2})-(\d{2}:\d{2})\z/
+          @mode = :custom
+          custom_start = $1
+          custom_stop = $2
+        else
+          error "Time range must follow <HH:MM>-<HH:MM>!"
+        end
+      when /\A-log(?:only)?\z/i
+        log_file_only = true
       else
         VALID_MODES.each do |mode, re|
+          next if re.nil?
           if re.match?(arg)
             set_compilation(mode)
             break
@@ -129,7 +143,7 @@ begin
       end
     end
   end
-  error "Please specify mode (-day or -night)!" if @mode.nil?
+  error "Please specify mode!" if @mode.nil?
   error "Please specify webcam!" if @webcam.nil?
 
   prefab_glob = Dir::glob(File::join(img_dir, "#{PREFAB_PFX}-*"))
@@ -143,7 +157,7 @@ begin
     end
   end
 
-  @logout = @logerr = File::open(LOG_fn, 'a') if open_log_file
+  @logout = File::open(LOG_fn, 'a')
 
   mp4_date = cur_date
   img_globs = []
@@ -167,8 +181,10 @@ begin
   end
 
   case @mode
-  when :current
+  when :all
     img_globs.push(File::join(img_dir, "*.jpg"))
+  when :date, :custom
+    img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-*.jpg"))
   when :morning
     img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-0[789]*.jpg"))
     img_globs.push(File::join(img_dir, "#{@webcam}-#{cur_date.strftime('%Y%m%d')}-1[01]*.jpg"))
@@ -202,12 +218,24 @@ begin
     img_globs.push(File::join(mp4_img_dir, '*.jpg'))
   end
 
+  ## Now that we have the date, compute any custom start and stop time
+  if @mode.eql?(:custom)
+    begin
+      custom_start_time = Time::parse(custom_start, mp4_date)
+      custom_stop_time = Time::parse(custom_stop, mp4_date)
+      info "Custom video compilation of images between #{custom_start_time.strftime('%H:%M')} and #{custom_stop_time.strftime('%H:%M')}"
+    rescue => ex
+      error "Invalid custom time format: #{ex.inspect}"
+    end
+  end
+
   mp4_date_str = mp4_date.strftime('%Y%m%d')
+  mode_str = @mode.to_s
 
   ## Move the set of images into a "processing" directory
   ## Alsoo calculate a time range of files we are going to be picking up
   if mp4_img_dir.nil?
-    mp4_img_dir = make_path(File::join(img_dir, "#{PREFAB_PFX}-#{mp4_date_str}-#{@mode.to_s}"))
+    mp4_img_dir = make_path(File::join(img_dir, "#{PREFAB_PFX}-#{mp4_date_str}-#{mode_str}"))
   end
 
   mp4_start_time = mp4_end_time = nil
@@ -216,19 +244,27 @@ begin
     img_paths = Dir::glob(img_glob)
     img_paths.each do |img_path|
       img_file = File::basename(img_path)
+      if img_file =~ /\A#{@webcam}-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})_(\d{3}).jpg\z/
+        begin
+          img_time = Time::new($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, "#{$6}.#{$7}".to_f)
+        rescue => ex
+          warn "Invalid image filename time format: #{img_file} - #{ex.inspect}"
+          img_time = nil
+        end
+      else
+        warn "Unrecognized image filename format: #{img_file}"
+        img_time = nil
+      end
       if @mode.eql?(:continue)
         mp4_img_paths.push(img_path)
+      elsif @mode.eql?(:custom) && ((img_time < custom_start_time) || (img_time > custom_stop_time))
+        next
       else
         mp4_img_path = File::join(mp4_img_dir, img_file)
         File::rename(img_path, mp4_img_path)
         mp4_img_paths.push(mp4_img_path)
       end
-      if img_file =~ /\A#{@webcam}-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})_(\d{3}).jpg\z/
-        img_time = Time::new($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, "#{$6}.#{$7}".to_f)
-      else
-        warn "Unrecognized image filename format: #{img_file}"
-        next
-      end
+      next if img_time.nil?
       mp4_start_time = img_time if mp4_start_time.nil? || img_time < mp4_start_time
       mp4_end_time = img_time if mp4_end_time.nil? || img_time > mp4_end_time
     end
@@ -237,7 +273,6 @@ begin
 
   mp4_time_range = "#{mp4_start_time.strftime('%H%M')}_#{mp4_end_time.strftime('%H%M')}"
 
-  mode_str = @mode.to_s
   mode_str << "-#{prev_mode}" if @mode.eql?(:continue)
   pid_info = "#{Process.pid}\n#{mode_str}\n#{mp4_date.strftime('%Y-%m-%d')}\n#{mp4_time_range}\n"
   File::write(@pid_fn, pid_info)
@@ -256,23 +291,38 @@ begin
     cmd_status = nil
     Open3::popen2e(cmd) do |stdin, stdout, wait_thr|
       stdin.close_write
+      newline_needed = false
       while cmdout = get_line(stdout)
+        ## Note: The following only goes to $stdout
         if cmdout.start_with?('frame=')
-          @logerr.print "#{cmdout}\r" unless open_log_file
+          unless log_file_only
+            $stderr.print "#{cmdout}\r"
+            newline_needed = true
+          end
         else
-          @logerr.puts cmdout unless open_log_file
+          unless log_file_only
+            if newline_needed
+              $stderr.puts
+              newline_needed = false
+            end
+            $stderr.puts cmdout 
+          end
           cmd_resp << cmdout
         end
       end
       cmd_status = wait_thr.value
     end
     if cmd_status != 0
-      error("command failed (#{cmd_status})\nCMD:\t#{cmd}\nOUT:\t#{cmd_resp}\n")
-    elsif open_log_file
-      info cmd_resp.join("\n")
+      msg = "command failed (#{cmd_status})"
+      error(msg, logout: false) unless log_file_only
+      error(msg << "\nCMD:\t#{cmd}\nOUT:\t#{cmd_resp}\n", stdout: false)
+    else
+      info(cmd_resp.join("\n"), stdout: false)
     end
   rescue Errno => ex
-    error("#{ex.inspect}\n\nCMD:\t#{cmd}")
+    msg = "#{ex.inspect}"
+    error(msg, logout: false) unless log_file_only
+    error(msg << "\nCMD:\t#{cmd}", stdout: false)
   end
 
 =begin
