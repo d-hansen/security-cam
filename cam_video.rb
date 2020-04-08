@@ -302,7 +302,7 @@ begin
         else
           unless log_file_only
             if newline_needed
-              $stderr.puts
+              $stderr.print "\n"
               newline_needed = false
             end
             $stderr.puts cmdout 
