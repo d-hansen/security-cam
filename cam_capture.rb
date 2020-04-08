@@ -30,22 +30,23 @@ CAM_max_delta = 120.0         ## Max seconds of no change before capturing frame
 
 CAM_cmp_metric = 'rmse'
 CAM_cmp_defs = {
-    'mae' =>  {
-          avg_size: 600,        ## Number of samples to average MAE for baseline
-          avg_cap: 0.017,       ## Cap mae avg at 1.7%
-          threshold_pct: 0.08,  ## 8% change over average MAE baseline triggers frame save
-      },
     'rmse' => {
           avg_size: 600,        ## Number of samples to average RMSE for baseline
           avg_cap: 0.025,       ## Cap rmse avg at 2.5%
           threshold_pct: 0.15,  ## 12% change over average RMSE baseline triggers frame save
+      },
+    'mae' =>  {
+          avg_size: 600,        ## Number of samples to average MAE for baseline
+          avg_cap: 0.017,       ## Cap mae avg at 1.7%
+          threshold_pct: 0.08,  ## 8% change over average MAE baseline triggers frame save
       },
   }
 CAM_cmp_ctrl = CAM_cmp_defs[CAM_cmp_metric]
 
 SNAPSHOT_url = '/snapshot.cgi'.freeze
 STREAM_url = '/videostream.cgi'.freeze
-
+CAMERA_CTL_url = '/camera_control.cgi'.freeze
+CONTRAST_SETTING = { 'param' => 2, value: nil }
 DECODER_CTL_url = '/decoder_control.cgi'.freeze
 DECODER_IR_ON =   { 'command' => '95' }
 DECODER_IR_OFF =  { 'command' => '94' }
@@ -53,6 +54,21 @@ CAM_IR_MODE = {
     on:   DECODER_IR_ON,
     off:  DECODER_IR_OFF
   }
+
+COMMON_HTTP_HDRS = {
+    'User-Agent' => 'security_cam.rb',
+    'Connection' => 'keep-alive',
+  }
+
+@http_uri = nil
+@http_conn = nil
+@http_req_count = 0
+@http_err_count = 0
+@snapshot_uri = nil
+@snapshot_req = nil
+@decoder_ctl_uri = nil
+@decoder_ctl_req = {}
+@camera_ctl_uri = nil   ## Camera ctl requests need to be made every time
 
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze
 
@@ -114,7 +130,7 @@ end
 def gm_timestamp(img_file, time, new_path)
   ret = nil
   new_img_file = File::join(new_path, File::basename(img_file))
-  gm_cmd = "gm convert -font #{CAM_font} -pointsize 16 -fill white -draw \"text 10,10 '#{time.strftime('%Y/%m/%d %H:%M:%S.%3N')}'\" #{img_file} #{new_img_file}"
+  gm_cmd = "gm convert -font #{CAM_font} -pointsize 16 -fill white -draw \"text 10,15 '#{time.strftime('%Y/%m/%d %H:%M:%S.%3N')}'\" #{img_file} #{new_img_file}"
   stdout, stderr, status = Open3.capture3(gm_cmd)
   err = stderr.strip
   if err.size > 0 || status != 0
@@ -151,22 +167,71 @@ rescue Errno::ENOENT => e
   nil
 end
 
-def decoder_ctl(mode)
-  raise "Bad mode #{mode.inspect}!" unless @decoder_ctl_req.key?(mode)
+def make_request(req)
+  if @http_conn.nil?
+    @http_conn = Net::HTTP.start(@http_uri.hostname, @http_uri.port) 
+    @http_req_count = 0
+    @http_err_count = 0
+  end
   begin
-    resp = @http.request(@decoder_ctl_req[mode])
-    if resp.is_a?(Net::HTTPSuccess)
-      warn "IR mode #{mode.to_s}"
+    @http_req_count += 1
+    resp = @http_conn.request(req)
+    if resp && resp.is_a?(Net::HTTPSuccess)
+      data = resp.body
+      @http_err_count = 0
     else
-      error "IR control #{mode.to_s} => #{resp.inspect}", action: :continue
-      mode = nil
+      err_msg = "HTTP request(#{req.to_hash}) => \n#{resp.inspect}"
+      @http_err_count += 1
+      if @http_err_count > 5
+        @http_err_count = 0
+        error err_msg, action: :continue
+        sleep 60
+      else
+        warn err_msg
+      end
+      data = nil
     end
   rescue => ex
-    error "HTTP request - #{ex.inspect}", action: :continue
-    @http = nil
+    error "HTTP request\n#{ex.inspect}\nTOTAL REQUESTS: #{@http_req_count}", action: :continue
+    @http_conn = nil
+    data = nil
+  end
+  data
+end
+
+def take_snapshot
+  ## Get the next image
+  @snapshot_uri = URI(CAM_list[@webcam] + SNAPSHOT_url) if @snapshot_uri.nil?
+  if @snapshot_req.nil?
+    @snapshot_uri.query = URI.encode_www_form(CAM_creds)
+    @snapshot_req = Net::HTTP::Get.new(@snapshot_uri, COMMON_HTTP_HDRS)
+  end
+  make_request(@snapshot_req)
+end
+
+def ir_control(mode)
+  raise "Bad mode #{mode.inspect}!" unless CAM_IR_MODE.key?(mode)
+  @decoder_ctl_uri = URI(CAM_list[@webcam] + DECODER_CTL_url) if @decoder_ctl_uri.nil?
+  unless @decoder_ctl_req.key?(mode)
+    @decoder_ctl_uri.query = URI.encode_www_form(CAM_IR_MODE[mode].merge(CAM_creds))
+    @decoder_ctl_req[mode] = Net::HTTP::Get.new(@decoder_ctl_uri, COMMON_HTTP_HDRS)
+  end
+  if make_request(@decoder_ctl_req[mode])
+    warn "IR mode #{mode.to_s}"
+  else
+    error "IR control #{mode.to_s} failed", action: :continue
     mode = nil
   end
   mode
+end
+
+def adjust_contrast(level)
+  raise "Bad contrast level #{level} (must be >= 0 and <= 6)!" unless (level >= 0) && (level <= 6)
+  CONTRAST_SETTING['value'] = level
+  @camera_ctl_uri = URI(CAM_list[@webcam] + CAMERA_CTL_url) if @camera_ctl_uri.nil?
+  @camera_ctl_uri.query = URI.encode_www_form(CONTRAST_SETTING.merge(CAM_creds))
+  req = Net::HTTP::Get.new(@camera_ctl_uri, COMMON_HTTP_HDRS)
+  make_request(req)
 end
 
 trap('SIGHUP') { reopen_log }
@@ -222,7 +287,7 @@ begin
           sts = Process.kill(sig, other_pid)
         end
       rescue Errno::ESRCH
-        notice "Process #{other_pid} not found -> continuing to daemonize"
+        notice "Process #{other_pid} not active -> continuing to daemonize"
       end
     end
     @log_fn = File::join(LOG_file_path, "cam_capture-#{@webcam}.log")
@@ -231,38 +296,24 @@ begin
     File::write(@pid_fn, "#{Process.pid}\n")
   end
 
-  ## This causes unnecessarily heavy rewrite of the same block on the flash
-  #@logout.sync = true
-  #@logerr.sync = true
+  ## Note: This (might) cause unnecessarily heavy write activity on the same disk block on a flash
+  ## Comment out if so.
+  @logout.sync = true
+  @logerr.sync = true
 
-  @http = nil
+  @http_uri = URI(CAM_list[@webcam])
 
-  ## Get the next image
-  @snapshot_uri = URI(CAM_list[@webcam] + SNAPSHOT_url)
-  @snapshot_uri.query = URI.encode_www_form(CAM_creds)
-  @snapshot_req = Net::HTTP::Get.new(@snapshot_uri)
-  @snapshot_req['User-Agent'] = 'security_cam.rb'
-  @snapshot_req['Connection'] = 'keep-alive'
-
-  @decoder_ctl_uri = URI(CAM_list[@webcam] + DECODER_CTL_url)
-  @decoder_ctl_req = {}
-  CAM_IR_MODE.keys.each do |mode|
-    @decoder_ctl_uri.query = URI.encode_www_form(CAM_IR_MODE[mode].merge(CAM_creds))
-    @decoder_ctl_req[mode] = Net::HTTP::Get.new(@decoder_ctl_uri)
-    @decoder_ctl_req[mode]['User-Agent'] = 'security_cam.rb'
-    @decoder_ctl_req[mode]['Connection'] = 'keep-alive'
-  end
-
-  metric_avg = nil
+  metric_baseline = nil
   cur_time = Time.now
   last_time = cur_time - CAM_period - 0.1
   prev_img_path = img_path = nil
   prev_img_time = nil
-  err_count = 0
   webcam_ir_mode = nil
   save_dir = make_path(File::join(CAM_root, 'images', @webcam))
   temp_dir = make_path(File::join('', 'tmp', 'security-cam', 'images', @webcam))
   pfx_sz = File::join(temp_dir, "#{@webcam}-YYYYmmdd-HH").size
+  contrast_level = nil
+  contrast_time = nil
   until @quit do
     cur_day = cur_time.day
 
@@ -273,81 +324,77 @@ begin
     until @quit do
       ## Delay until the next CAM_period
       break unless cur_time.day.eql?(cur_day)
-      wait_secs = (last_time + CAM_period) - cur_time
-      last_time = cur_time
+      wait_secs = (last_time + CAM_period) - Time.now
       sleep(wait_secs) if wait_secs > 0.0
+      last_time = cur_time
       cur_time = Time.now
 
-      @http = Net::HTTP.start(@snapshot_uri.hostname, @snapshot_uri.port) if @http.nil?
-
       ## Check if we need to turn on/off IR
-      webcam_decoder_ctl_params = nil
       if (cur_time > sunrise) && (cur_time < sunset)
-        webcam_ir_mode = decoder_ctl(:off) unless webcam_ir_mode.eql?(:off)
+        webcam_ir_mode = ir_control(:off) unless webcam_ir_mode.eql?(:off)
+        contrast_level = 3
+        contrast_time = cur_time + 1800  ## Adjust/fix contrast in 30 minutes
       else
-        webcam_ir_mode = decoder_ctl(:on) unless webcam_ir_mode.eql?(:on)
+        webcam_ir_mode = ir_control(:on) unless webcam_ir_mode.eql?(:on)
+        ## Perhaps during the day, increase contrast?
+        ## Tends to really darken some areas though and trigger more movement.
+        #contrast_level = 4
+        #contrast_time = cur_time
       end
       next if webcam_ir_mode.nil?
 
-      begin
-        resp = @http.request(@snapshot_req)
-      rescue => ex
-        error "HTTP request - #{ex.inspect}", action: :continue
-        @http = nil
-        resp = nil
+      if contrast_time && (cur_time >= contrast_time)
+        ## At night, we'll first take contrast to 0 to "reset" the camera
+        if (cur_time > sunset)
+          adjust_contrast(0)
+          sleep(2)      ## Wait for camera to stabilize to contrast level 0
+        end
+        adjust_contrast(contrast_level)
+        contrast_time = nil
+        sleep(2) ## don't take a snapshot straight away, wait for camera adjust to new contrast level
       end
 
-      if resp.nil?
-        next
-      elsif resp.is_a?(Net::HTTPSuccess)
-        err_count = 0
-        img_path = File::join(temp_dir, "#{@webcam}-#{cur_time.strftime('%Y%m%d-%H%M%S_%3N')}.jpg")
-        File::write(img_path, resp.body)
+      snapshot = take_snapshot
+      next if snapshot.nil?
 
-        ## Determine if this is a different enough image to keep
-        if prev_img_path.nil?
+      img_path = File::join(temp_dir, "#{@webcam}-#{cur_time.strftime('%Y%m%d-%H%M%S_%3N')}.jpg")
+      File::write(img_path, snapshot)
+
+      ## Determine if this is a different enough image to keep
+      if prev_img_path.nil?
+        prev_img_path = img_path
+        prev_img_time = cur_time
+      else
+        metric_val = gm_compare(prev_img_path, img_path)
+        if metric_val.nil?
+          action = :ERROR
+        else
+          metric_capped = (metric_val < CAM_cmp_ctrl[:avg_cap]) ? metric_val : CAM_cmp_ctrl[:avg_cap]
+          if metric_baseline.nil?
+            metric_ary = [metric_capped] * CAM_cmp_ctrl[:avg_size]
+            metric_baseline = metric_capped
+          else
+            metric_baseline += (metric_capped - metric_ary.shift)/metric_ary.size
+            metric_ary.push(metric_capped)
+          end
+          diff = metric_val - metric_baseline
+          action = 
+            if (diff > (metric_baseline * CAM_cmp_ctrl[:threshold_pct]))
+              :SAVED
+            elsif ((cur_time - prev_img_time) > CAM_max_delta)
+              :SYNC
+            else
+              :drop
+            end
+          info "#{webcam_ir_mode.eql?(:on) ? 'IR ' : ''}compare [#{prev_img_path[pfx_sz..-5]} ≟ #{img_path[pfx_sz..-5]}] #{sprintf('≏:%.4f, ⌀:%.4f, Δ:%.4f', metric_val, metric_baseline, diff)} -> #{action.to_s}"
+        end
+        case action
+        when :SAVED, :SYNC
+          gm_timestamp(prev_img_path, prev_img_time, save_dir)
           prev_img_path = img_path
           prev_img_time = cur_time
-        else
-          metric_val = gm_compare(prev_img_path, img_path)
-          if metric_val.nil?
-            action = :ERROR
-          else
-            metric_capped = (metric_val < CAM_cmp_ctrl[:avg_cap]) ? metric_val : CAM_cmp_ctrl[:avg_cap]
-            if metric_avg.nil?
-              metric_ary = [metric_capped] * CAM_cmp_ctrl[:avg_size]
-              metric_avg = metric_capped
-            else
-              metric_avg += (metric_capped - metric_ary.shift)/metric_ary.size
-              metric_ary.push(metric_capped)
-            end
-            diff = metric_val - metric_avg
-            action = 
-              if (diff > (metric_avg * CAM_cmp_ctrl[:threshold_pct]))
-                :SAVED
-              elsif ((cur_time - prev_img_time) > CAM_max_delta)
-                :SYNC
-              else
-                :drop
-              end
-            info "#{webcam_ir_mode.eql?(:on) ? 'IR ' : ''}compare [#{prev_img_path[pfx_sz..-5]} ≟ #{img_path[pfx_sz..-5]}] #{sprintf('≏:%.4f, ⌀:%.4f, Δ:%.4f', metric_val, metric_avg, diff)} -> #{action.to_s}"
-          end
-          case action
-          when :SAVED, :SYNC
-            gm_timestamp(prev_img_path, prev_img_time, save_dir)
-            prev_img_path = img_path
-            prev_img_time = cur_time
-          when :drop, :ERROR
-            File::delete(img_path)
-          end
-        end
-      else
-        err_count += 1
-        if err_count > 5
-          error resp.inspect, action: :continue
-          sleep 60
-        else
-          warn resp.inspect
+        when :drop, :ERROR
+          File::delete(img_path)
         end
       end
     end
@@ -358,7 +405,7 @@ rescue => ex
 
 ensure
   ## Make sure last frame was timestamped upon exit
-  gm_timestamp(prev_img_path, prev_img_time) unless prev_img_path.nil?
+  gm_timestamp(prev_img_path, prev_img_time, save_dir) unless prev_img_path.nil?
   notice "Exiting"
   if @daemon
     @logout.close

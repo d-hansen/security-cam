@@ -69,6 +69,26 @@ def set_compilation(mode)
   @mode = mode
 end
 
+def get_line(io)
+  line = nil
+  maybe_line_term = false
+  io.each_char do |ch|
+    if ch.eql?("\r")
+      next if line.nil?         ##just ignore if it's the first thing encountered ('\n\r' case)
+      maybe_line_term = true    ## check for '\r\n' case.
+      next
+    elsif maybe_line_term && !ch.eql?("\n")
+      io.ungetc(ch)             ## just a plain old '\r' all by itself - we'll call that a "line"
+      break
+    elsif ch.eql?("\n")
+      break
+    end
+    line = '' if line.nil?
+    line << ch
+  end
+  line
+end
+
 @webcam = nil
 @mode = nil
 
@@ -230,14 +250,19 @@ begin
   begin
     cmd = "ffmpeg -y "
     cmd << "-f image2 -framerate 5 -pattern_type glob -i '#{mp4_img_glob}' "
-    cmd << "-c:v libx264 -movflags +faststart #{mp4_path}"
+    ##cmd << "-c:v libx264 "    ## Not currently available on OpenWRT Raspberry Pi
+    cmd << "-movflags +faststart #{mp4_path}"
     cmd_resp = []
     cmd_status = nil
     Open3::popen2e(cmd) do |stdin, stdout, wait_thr|
       stdin.close_write
-      while cmdout = stdout.gets(chomp: true)
-        @logerr.puts cmdout unless open_log_file
-        cmd_resp << cmdout
+      while cmdout = get_line(stdout)
+        if cmdout.start_with?('frame=')
+          @logerr.print "#{cmdout}\r" unless open_log_file
+        else
+          @logerr.puts cmdout unless open_log_file
+          cmd_resp << cmdout
+        end
       end
       cmd_status = wait_thr.value
     end
