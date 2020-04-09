@@ -231,7 +231,11 @@ def adjust_contrast(level)
   @camera_ctl_uri = URI(CAM_list[@webcam] + CAMERA_CTL_url) if @camera_ctl_uri.nil?
   @camera_ctl_uri.query = URI.encode_www_form(CONTRAST_SETTING.merge(CAM_creds))
   req = Net::HTTP::Get.new(@camera_ctl_uri, COMMON_HTTP_HDRS)
-  make_request(req)
+  if make_request(req)
+    warn "Contrast level set to #{level}"
+  else
+    error "Camera control for contrast #{level} failed", action: :continue
+  end
 end
 
 trap('SIGHUP') { reopen_log }
@@ -332,26 +336,29 @@ begin
       ## Check if we need to turn on/off IR
       if (cur_time > sunrise) && (cur_time < sunset)
         webcam_ir_mode = ir_control(:off) unless webcam_ir_mode.eql?(:off)
-        contrast_level = 3
-        contrast_time = cur_time + 1800  ## Adjust/fix contrast in 30 minutes
-      else
-        webcam_ir_mode = ir_control(:on) unless webcam_ir_mode.eql?(:on)
         ## Perhaps during the day, increase contrast?
         ## Tends to really darken some areas though and trigger more movement.
         #contrast_level = 4
         #contrast_time = cur_time
+      else
+        webcam_ir_mode = ir_control(:on) unless webcam_ir_mode.eql?(:on)
+        #contrast_time = Time::parse("22:30:00", cur_time) ## Adjust/fix contrast @ 10:30PM
+        contrast_time = cur_time + 1800 ## Adjust/fix contrast in 30 minutes
+        contrast_level = 3
       end
       next if webcam_ir_mode.nil?
 
       if contrast_time && (cur_time >= contrast_time)
         ## At night, we'll first take contrast to 0 to "reset" the camera
         if (cur_time > sunset)
-          adjust_contrast(0)
-          sleep(2)      ## Wait for camera to stabilize to contrast level 0
+          [0...contrast_level].each do |level|
+            adjust_contrast(level)
+            sleep(5)      ## Wait for camera to stabilize
+          end
         end
         adjust_contrast(contrast_level)
         contrast_time = nil
-        sleep(2) ## don't take a snapshot straight away, wait for camera adjust to new contrast level
+        sleep(5) ## don't take a snapshot straight away, wait for camera adjust to new contrast level
       end
 
       snapshot = take_snapshot
