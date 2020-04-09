@@ -30,7 +30,7 @@ $stdout.sync = true
 
 def log_message(msg, opts = {})
   msg = "#{Time.now.strftime(LOG_TIME_fmt)}CV(#{@webcam}) #{msg}"
-  @logout.puts(msg) unless opts.key?(:logout) && opts[:logout].eql?(false)
+  @logout.puts(msg) unless @logout.nil? || opts.key?(:logout) && opts[:logout].eql?(false)
   $stdout.puts(msg) unless opts.key?(:stdout) && opts[:stdout].eql?(false)
 end
 
