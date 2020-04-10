@@ -341,10 +341,12 @@ begin
         #contrast_level = 4
         #contrast_time = cur_time
       else
-        webcam_ir_mode = ir_control(:on) unless webcam_ir_mode.eql?(:on)
-        #contrast_time = Time::parse("22:30:00", cur_time) ## Adjust/fix contrast @ 10:30PM
-        contrast_time = cur_time + 1800 ## Adjust/fix contrast in 30 minutes
-        contrast_level = 3
+        unless webcam_ir_mode.eql?(:on)
+          webcam_ir_mode = ir_control(:on)
+          #contrast_time = Time::parse("22:30:00", cur_time) ## Adjust/fix contrast @ 10:30PM
+          contrast_time = cur_time + 1800 ## Adjust/fix contrast in 30 minutes
+          contrast_level = 3
+        end
       end
       next if webcam_ir_mode.nil?
 
