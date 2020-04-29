@@ -3,7 +3,7 @@
 require 'open3'
 require 'time'
 require 'fileutils'
-##require 'byebug'
+#require 'byebug'
 
 CAM_root = File::join('', 'data', 'security-cam').freeze
 
@@ -27,11 +27,12 @@ VALID_MODES = {
   }
 
 $stdout.sync = true
+@logout = nil
 
 def log_message(msg, opts = {})
   msg = "#{Time.now.strftime(LOG_TIME_fmt)}CV(#{@webcam}) #{msg}"
-  @logout.puts(msg) unless @logout.nil? || opts.key?(:logout) && opts[:logout].eql?(false)
-  $stdout.puts(msg) unless opts.key?(:stdout) && opts[:stdout].eql?(false)
+  @logout.puts(msg) unless @logout.nil? || (opts.key?(:logout) && opts[:logout].eql?(false))
+  $stdout.puts(msg) unless @log_file_only || (opts.key?(:stdout) && opts[:stdout].eql?(false))
 end
 
 def error(msg, opts = {action: :exit})
@@ -94,7 +95,7 @@ end
 @mode = nil
 
 begin
-  log_file_only = false
+  @log_file_only = false
   custom_start = custom_stop = nil
   cur_date = Time.now
   while ARGV.size > 0
@@ -123,7 +124,7 @@ begin
           error "Time range must follow <HH:MM>-<HH:MM>!"
         end
       when /\A-log(?:only)?\z/i
-        log_file_only = true
+        @log_file_only = true
       else
         VALID_MODES.each do |mode, re|
           next if re.nil?
@@ -271,6 +272,11 @@ begin
   end
   mp4_img_glob = File::join(mp4_img_dir, '*.jpg')
 
+  if mp4_img_paths.empty?
+    Dir::delete(mp4_img_dir)
+    error "No images found for #{mp4_date_str} #{@mode.to_s}!"
+  end
+
   mp4_time_range = "#{mp4_start_time.strftime('%H%M')}_#{mp4_end_time.strftime('%H%M')}"
 
   mode_str << "-#{prev_mode}" if @mode.eql?(:continue)
@@ -295,12 +301,12 @@ begin
       while cmdout = get_line(stdout)
         ## Note: The following only goes to $stdout
         if cmdout.start_with?('frame=')
-          unless log_file_only
+          unless @log_file_only
             $stderr.print "#{cmdout}\r"
             newline_needed = true
           end
         else
-          unless log_file_only
+          unless @log_file_only
             if newline_needed
               $stderr.print "\n"
               newline_needed = false
@@ -314,14 +320,14 @@ begin
     end
     if cmd_status != 0
       msg = "command failed (#{cmd_status})"
-      error(msg, logout: false) unless log_file_only
+      error(msg, logout: false) unless @log_file_only
       error(msg << "\nCMD:\t#{cmd}\nOUT:\t#{cmd_resp}\n", stdout: false)
     else
       info(cmd_resp.join("\n"), stdout: false)
     end
   rescue Errno => ex
     msg = "#{ex.inspect}"
-    error(msg, logout: false) unless log_file_only
+    error(msg, logout: false) unless @log_file_only
     error(msg << "\nCMD:\t#{cmd}", stdout: false)
   end
 
