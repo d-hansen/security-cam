@@ -73,7 +73,7 @@ COMMON_HTTP_HDRS = {
 LOG_TIME_fmt = '[%Y-%m-%d_%H:%M:%S.%3N_%Z]'.freeze
 
 LOG_file_path = File::join(CAM_root, 'logs').freeze
-PID_file_prefix = '/var/run/cam_capture'.freeze
+PID_file_prefix = File::join('', 'var', 'run', 'cam_capture').freeze
 
 
 $stdout.sync = true
@@ -168,11 +168,17 @@ rescue Errno::ENOENT => e
 end
 
 def make_request(req)
-  if @http_conn.nil?
-    @http_conn = Net::HTTP.start(@http_uri.hostname, @http_uri.port) 
-    @http_req_count = 0
-    @http_err_count = 0
+  begin
+    if @http_conn.nil?
+      @http_conn = Net::HTTP.start(@http_uri.hostname, @http_uri.port)
+      @http_req_count = 0
+      @http_err_count = 0
+    end
+  rescue => ex
+    error "HTTP connect\n\t#{ex.inspect}", action: :continue
+    return nil
   end
+
   begin
     @http_req_count += 1
     resp = @http_conn.request(req)
@@ -192,7 +198,7 @@ def make_request(req)
       data = nil
     end
   rescue => ex
-    error "HTTP request\n#{ex.inspect}\nTOTAL REQUESTS: #{@http_req_count}", action: :continue
+    error "HTTP request (total requests: #{@http_req_count})\n\t#{ex.inspect}\n", action: :continue
     @http_conn = nil
     data = nil
   end
@@ -226,7 +232,7 @@ def ir_control(mode)
 end
 
 def adjust_contrast(level)
-  raise "Bad contrast level #{level} (must be >= 0 and <= 6)!" unless (level >= 0) && (level <= 6)
+  raise "Bad contrast level #{level} (must be >= 0 and <= 6)!" unless level.is_a?(Integer) && (level >= 0) && (level <= 6)
   CONTRAST_SETTING['value'] = level
   @camera_ctl_uri = URI(CAM_list[@webcam] + CAMERA_CTL_url) if @camera_ctl_uri.nil?
   @camera_ctl_uri.query = URI.encode_www_form(CONTRAST_SETTING.merge(CAM_creds))
@@ -353,7 +359,7 @@ begin
       if contrast_time && (cur_time >= contrast_time)
         ## At night, we'll first take contrast to 0 to "reset" the camera
         if (cur_time > sunset)
-          [0...contrast_level].each do |level|
+          (0...contrast_level).each do |level|
             adjust_contrast(level)
             sleep(5)      ## Wait for camera to stabilize
           end
